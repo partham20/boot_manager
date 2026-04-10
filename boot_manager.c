@@ -1,56 +1,75 @@
 /*
  * boot_manager.c
  *
- * Boot Manager for F28P55x â€” lives in Bank 0 Sectors 0-3 (0x080000-0x080FFF).
- * NEVER erased by OTA. Loaded via JTAG once.
+ * Boot Manager for F28P55x — lives in Bank 0 Sectors 0-7 (0x080000-0x081FFF).
+ * NEVER erased by OTA. Loaded via JTAG once at manufacturing.
  *
- * On every boot:
- *   1. Init flash module (required to read/write flash)
- *   2. Read boot flag from Bank 3 (0x0E0000)
- *   3. If update pending (0xA5A5) and CRC valid (0x5A5A):
- *      a. Re-verify CRC32 of Bank 2
- *      b. Erase Bank 0 sectors 4-127 (app area)
- *      c. Copy Bank 2 â†’ Bank 0 sectors 4-127
- *      d. Clear boot flag
- *      e. Reset
- *   4. Otherwise: jump to application at 0x081000
+ * On every boot it:
+ *   1. Brings up the core clocks (Device_init — 150 MHz PLL).
+ *   2. Blinks LED on GPIO 21 briefly so we can see it entered.
+ *   3. Sends a "BOOT_MGR_HELLO" CAN-FD frame on MCANA so the host/M-Board
+ *      knows the boot manager is running.
+ *   4. Reads the boot flag at 0x0E0000.
+ *   5. If flag says "update pending" AND Bank 2 CRC matches, it:
+ *        - Erases Bank 0 sectors 8..127 (application area)
+ *        - Copies Bank 2 -> Bank 0 application area
+ *        - Clears the boot flag
+ *        - Resets the device so the new firmware runs fresh
+ *   6. Otherwise it jumps straight to the application at 0x082000.
  *
  * Author: Parthasarathy.M
- * Date:   03-Apr-2026
  */
 
+#include <string.h>
 #include "driverlib.h"
 #include "device.h"
 #include "FlashTech_F28P55x_C28x.h"
 #include "flash_programming_f28p55x.h"
 
-/* â”€â”€ Addresses â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-#define APP_ENTRY_ADDR      0x082000UL  /* Application starts here (sector 8) */
-#define BANK0_APP_START     0x082000UL  /* Bank 0 sector 8 */
-#define BANK0_APP_END       0x09FFFFUL  /* Bank 0 sector 127 end */
-#define BANK2_START         0x0C0000UL
-#define BANK3_FLAG_ADDR     0x0E0000UL  /* Boot flag location */
+/* ── Memory map ───────────────────────────────────────────────── */
+#define APP_ENTRY_ADDR          0x082000UL  /* Application codestart */
+#define BANK0_APP_START         0x082000UL  /* First app sector (sector 8) */
+#define BANK2_START             0x0C0000UL  /* Staging bank */
+#define BANK3_FLAG_ADDR         0x0E0000UL  /* Boot flag sector */
 
-#define SECTOR_SIZE_WORDS   0x400U      /* 2KB sector = 0x400 uint16 words */
-#define APP_SECTOR_COUNT    120         /* Sectors 8-127 */
-#define APP_FIRST_SECTOR    8
+#define SECTOR_SIZE_WORDS       0x400U      /* 2KB sector = 0x400 16-bit words */
+#define APP_SECTOR_COUNT        120U        /* Sectors 8..127 */
 
-/* Flash write-enable */
-#define SEC0TO31            0x00000000U
-#define SEC32To127          0xFFFFFFFFU
+/* Flash write-enable masks (all sectors unlocked while we work) */
+#define SEC0_TO_31_UNLOCK       0x00000000U
+#define SEC32_TO_127_UNLOCK     0x00000000U
 
-/* â”€â”€ Boot flag layout (must match fw_image_rx.h) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-/* Word 0: updatePending  (0xA5A5 = update ready)
- * Word 1: crcValid       (0x5A5A = CRC confirmed by app)
- * Word 2: imageSize low  (uint16)
- * Word 3: imageSize high (uint16)
- * Word 4: imageCRC low   (uint16)
- * Word 5: imageCRC high  (uint16)
- */
-#define FLAG_UPDATE_PENDING 0xA5A5U
-#define FLAG_CRC_VALID      0x5A5AU
+/* ── Boot flag layout (must match fw_image_rx.c in the application) ── */
+/* Word 0: updatePending (0xA5A5 = update ready)                      */
+/* Word 1: crcValid      (0x5A5A = CRC confirmed by app)              */
+/* Word 2: imageSize low  (uint16)                                    */
+/* Word 3: imageSize high (uint16)                                    */
+/* Word 4: imageCRC low   (uint16)                                    */
+/* Word 5: imageCRC high  (uint16)                                    */
+#define FLAG_UPDATE_PENDING     0xA5A5U
+#define FLAG_CRC_VALID          0x5A5AU
 
-/* â”€â”€ CRC32 lookup table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* ── CAN hello ────────────────────────────────────────────────── */
+#define BOOT_HELLO_CAN_ID       0x09U       /* Unused by app (see common.h) */
+
+/* Minimal MCAN message RAM layout — TX buffer 0 only, no RX, no filters */
+#define BOOT_MCAN_TX_BUF_ADDR   0x0000U
+#define BOOT_MCAN_TX_BUF_NUM    1U
+
+/* ── Prototypes ───────────────────────────────────────────────── */
+static void      ledInit(void);
+static void      ledSet(uint16_t on);
+static void      canSendHello(void);
+static void      configureMCANA(void);
+static uint32_t  computeCRC32(uint32_t startAddr, uint32_t numBytes);
+static void      eraseSector(uint32_t sectorAddr);
+static void      programEightWords(uint32_t destAddr, const uint16_t *src);
+static void      copyBank2ToBank0(uint32_t imageSize);
+static void      clearBootFlag(void);
+static void      delayCycles(uint32_t cycles);
+static void      jumpToApp(void);
+
+/* ── CRC32 lookup table (IEEE 802.3, reflected) ──────────────── */
 static const uint32_t crc32Table[256] = {
     0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA,
     0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
@@ -118,200 +137,337 @@ static const uint32_t crc32Table[256] = {
     0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D
 };
 
-/* â”€â”€ Forward declarations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-static uint32_t  computeCRC32(uint32_t startAddr, uint32_t numBytes);
-static void      eraseSector(uint32_t sectorAddr);
-static void      programWords(uint32_t destAddr, const uint16_t *src);
-static void      clearBootFlag(void);
-static void      copyBank2ToBank0(uint32_t imageSize);
-static void      jumpToApp(void);
-
-volatile uint16_t debugHalt;
-
-/* â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�
- *  MAIN â€” Boot manager entry point
- *  Runs from flash 0x080000 on every power-up/reset.
- * â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•� */
+/* ══════════════════════════════════════════════════════════════
+ *  MAIN — boot manager entry point
+ * ══════════════════════════════════════════════════════════════ */
 void main(void)
 {
+    volatile uint16_t *flag;
+    uint16_t updatePending;
+    uint16_t crcValid;
+    uint32_t imageSize;
+    uint32_t imageCRC;
 
-    debugHalt = 1;
+    /* 1. Bring up clocks + watchdog off.
+     *    Device_init() sets PLL to 150 MHz using the LaunchPad XTAL
+     *    and configures the flash wait-states for that clock. */
+    Device_init();
 
+    /* 2. Early visible sign-of-life: LED on GPIO 21. */
+    ledInit();
+    ledSet(1U);
 
-  while(debugHalt);  // ← pause here, set debugHalt=0 in CCS to continue
+    /* 3. Send the boot-mgr hello frame so external tools can see us. */
+    canSendHello();
 
+    /* 4. Hold the LED on for ~150 ms so it is visibly distinct. */
+    delayCycles(DEVICE_SYSCLK_FREQ / 7U);   /* ~150 ms */
+    ledSet(0U);
 
-    /* Disable watchdog first â€” Device_init does too much for boot manager */
-    SysCtl_disableWatchdog();
+    /* 5. Read the boot flag word-by-word. */
+    flag          = (volatile uint16_t *)BANK3_FLAG_ADDR;
+    updatePending = flag[0];
+    crcValid      = flag[1];
+    imageSize     = (uint32_t)flag[2] | ((uint32_t)flag[3] << 16);
+    imageCRC      = (uint32_t)flag[4] | ((uint32_t)flag[5] << 16);
 
-    /* Set flash wait states (required before any flash read at speed) */
-    Flash_initModule(FLASH0CTRL_BASE, FLASH0ECC_BASE, 3);
-
-    /* Read boot flag from Bank 3 first sector */
-    volatile uint16_t *flag = (volatile uint16_t *)BANK3_FLAG_ADDR;
-
-    uint16_t updatePending = flag[0];
-    uint16_t crcValid      = flag[1];
-    uint32_t imageSize     = (uint32_t)flag[2] | ((uint32_t)flag[3] << 16);
-    uint32_t imageCRC      = (uint32_t)flag[4] | ((uint32_t)flag[5] << 16);
-
-    if (updatePending == FLAG_UPDATE_PENDING && crcValid == FLAG_CRC_VALID)
+    if ((updatePending == FLAG_UPDATE_PENDING) &&
+        (crcValid      == FLAG_CRC_VALID))
     {
-        /* Init Flash API â€” only needed when we actually erase/program */
+        /* 6. Initialise the Flash API (RAM-resident) before any
+         *    erase/program operation. */
+        EALLOW;
         Fapi_initializeAPI(FlashTech_CPU0_BASE_ADDRESS,
                            DEVICE_SYSCLK_FREQ / 1000000U);
         Fapi_setActiveFlashBank(Fapi_FlashBank0);
+        EDIS;
 
-        /* Update is pending â€” verify Bank 2 CRC before copying */
-        uint32_t computedCRC = computeCRC32(BANK2_START, imageSize);
-
-        if (computedCRC == imageCRC)
+        /* 7. Verify Bank 2 contents before we touch the app area. */
+        if (computeCRC32(BANK2_START, imageSize) == imageCRC)
         {
-            /* CRC matches â€” safe to copy */
             copyBank2ToBank0(imageSize);
             clearBootFlag();
-
-            /* Reset to boot fresh with new firmware */
             SysCtl_resetDevice();
-            /* Never reaches here */
+            /* unreachable */
         }
         else
         {
-            /* CRC mismatch â€” Bank 2 is corrupt.
-             * Clear the flag so we don't retry forever.
-             * Boot the old app (which may be partially erased
-             * from a previous failed attempt â€” but at least
-             * we won't loop). */
+            /* Bank 2 is corrupt — clear the flag so we do not retry
+             * forever, then boot the existing app (which may itself
+             * be damaged; user will need to re-flash over JTAG). */
             clearBootFlag();
         }
     }
 
-    /* No update pending (or CRC failed) â€” jump to application */
+    /* 8. Hand control to the application. */
     jumpToApp();
 }
 
-/* â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�
- *  JUMP TO APPLICATION at 0x081000
- * â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•� */
+/* ══════════════════════════════════════════════════════════════
+ *  LED (GPIO 21)
+ * ══════════════════════════════════════════════════════════════ */
+static void ledInit(void)
+{
+    GPIO_setPinConfig(GPIO_21_GPIO21);
+    GPIO_setPadConfig(21U, GPIO_PIN_TYPE_STD);
+    GPIO_setDirectionMode(21U, GPIO_DIR_MODE_OUT);
+    GPIO_writePin(21U, 1U);   /* LaunchPad LED is active-low — start off */
+}
+
+static void ledSet(uint16_t on)
+{
+    /* LaunchPad LED is active-low: writing 0 drives the LED on. */
+    GPIO_writePin(21U, on ? 0U : 1U);
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  CAN HELLO — MCANA on GPIO 4 (TX) / GPIO 5 (RX), 500k/2M FD
+ * ══════════════════════════════════════════════════════════════ */
+static void configureMCANA(void)
+{
+    MCAN_InitParams         initParams;
+    MCAN_MsgRAMConfigParams ramCfg;
+    MCAN_BitTimingParams    bitTimes;
+
+    memset(&initParams, 0, sizeof(initParams));
+    memset(&ramCfg,     0, sizeof(ramCfg));
+    memset(&bitTimes,   0, sizeof(bitTimes));
+
+    /* MCANA module clock = SYSCLK / 5 = 30 MHz (matches application) */
+    SysCtl_setMCANClk(SYSCTL_MCANA, SYSCTL_MCANCLK_DIV_5);
+
+    /* Pinmux for MCANA — GPIO 4 = TX, GPIO 5 = RX (LaunchPad) */
+    GPIO_setPinConfig(GPIO_4_MCANA_TX);
+    GPIO_setPinConfig(GPIO_5_MCANA_RX);
+
+    /* FD + BRS so we match the app's bus settings */
+    initParams.fdMode    = 0x1U;
+    initParams.brsEnable = 0x1U;
+
+    /* Minimal message RAM layout — TX buffer 0 only */
+    ramCfg.flssa           = 0U;
+    ramCfg.lss             = 0U;
+    ramCfg.lse             = 0U;
+    ramCfg.txStartAddr     = BOOT_MCAN_TX_BUF_ADDR;
+    ramCfg.txBufNum        = BOOT_MCAN_TX_BUF_NUM;
+    ramCfg.txFIFOSize      = 0U;
+    ramCfg.txBufElemSize   = MCAN_ELEM_SIZE_64BYTES;
+
+    /* Bit timing — same as the application:
+     *   Nominal 500 kbps @ 80% sample point
+     *   Data    2 Mbps   @ 80% sample point (30 MHz MCAN clock) */
+    bitTimes.nomRatePrescalar  = 0x5U;
+    bitTimes.nomTimeSeg1       = 0x6U;
+    bitTimes.nomTimeSeg2       = 0x1U;
+    bitTimes.nomSynchJumpWidth = 0x1U;
+
+    bitTimes.dataRatePrescalar  = 0x0U;
+    bitTimes.dataTimeSeg1       = 0xAU;
+    bitTimes.dataTimeSeg2       = 0x2U;
+    bitTimes.dataSynchJumpWidth = 0x2U;
+
+    /* Wait for message RAM init from the previous reset */
+    while (FALSE == MCAN_isMemInitDone(MCANA_DRIVER_BASE)) { }
+
+    MCAN_setOpMode(MCANA_DRIVER_BASE, MCAN_OPERATION_MODE_SW_INIT);
+    while (MCAN_OPERATION_MODE_SW_INIT !=
+           MCAN_getOpMode(MCANA_DRIVER_BASE)) { }
+
+    MCAN_init(MCANA_DRIVER_BASE, &initParams);
+    MCAN_setBitTime(MCANA_DRIVER_BASE, &bitTimes);
+    MCAN_msgRAMConfig(MCANA_DRIVER_BASE, &ramCfg);
+
+    MCAN_setOpMode(MCANA_DRIVER_BASE, MCAN_OPERATION_MODE_NORMAL);
+    while (MCAN_OPERATION_MODE_NORMAL !=
+           MCAN_getOpMode(MCANA_DRIVER_BASE)) { }
+}
+
+static void canSendHello(void)
+{
+    MCAN_TxBufElement txMsg;
+    volatile uint32_t timeout;
+
+    configureMCANA();
+
+    memset(&txMsg, 0, sizeof(txMsg));
+
+    /* Standard 11-bit ID sits in the upper 11 bits (bits 18..28) */
+    txMsg.id  = ((uint32_t)BOOT_HELLO_CAN_ID) << 18U;
+    txMsg.rtr = 0U;
+    txMsg.xtd = 0U;           /* standard ID */
+    txMsg.esi = 0U;
+    txMsg.dlc = 8U;           /* 8-byte payload is plenty for a hello */
+    txMsg.brs = 0x1U;
+    txMsg.fdf = 0x1U;         /* CAN-FD frame */
+    txMsg.efc = 1U;
+    txMsg.mm  = 0xB0U;
+
+    /* Payload: "BOOTMGR" + protocol/format version byte */
+    txMsg.data[0] = 'B';
+    txMsg.data[1] = 'O';
+    txMsg.data[2] = 'O';
+    txMsg.data[3] = 'T';
+    txMsg.data[4] = 'M';
+    txMsg.data[5] = 'G';
+    txMsg.data[6] = 'R';
+    txMsg.data[7] = 0x01U;
+
+    MCAN_writeMsgRam(MCANA_DRIVER_BASE, MCAN_MEM_TYPE_BUF, 0U, &txMsg);
+    MCAN_txBufAddReq(MCANA_DRIVER_BASE, 0U);
+
+    /* Best-effort wait for TX complete (~10 ms worst-case). We never
+     * block forever — if the bus is unplugged we must still boot. */
+    for (timeout = 0U; timeout < 2000000U; timeout++)
+    {
+        if (MCAN_getTxBufReqPend(MCANA_DRIVER_BASE) == 0U)
+        {
+            break;
+        }
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  DELAY — simple busy-wait (SysCtl_delay is in driverlib/ramfunc)
+ * ══════════════════════════════════════════════════════════════ */
+static void delayCycles(uint32_t cycles)
+{
+    volatile uint32_t i;
+    for (i = 0U; i < cycles; i++)
+    {
+        __asm(" NOP");
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  JUMP TO APPLICATION
+ *  The application has its own codestart at APP_ENTRY_ADDR which
+ *  branches to _c_int00 (C runtime init → application main()).
+ * ══════════════════════════════════════════════════════════════ */
 static void jumpToApp(void)
 {
-    /* Cast address to function pointer and call.
-     * The app has its own codestart at 0x081000 which
-     * branches to _c_int00 (C runtime init â†’ main). */
     ((void (*)(void))APP_ENTRY_ADDR)();
 }
 
-/* â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�
- *  COPY Bank 2 â†’ Bank 0 (sectors 4-127 only)
+/* ══════════════════════════════════════════════════════════════
+ *  COPY Bank 2 → Bank 0 application area (sectors 8..127 only)
  *
- *  Erases app area first, then copies word-by-word.
- *  Flash writes are 8 x uint16 (512-bit) per call.
- * â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•� */
+ *  Erases the app area first, then streams the staged image
+ *  across in 8-word (512-bit) chunks which is the smallest
+ *  granularity the F28P55x flash controller accepts.
+ * ══════════════════════════════════════════════════════════════ */
 static void copyBank2ToBank0(uint32_t imageSize)
 {
     uint32_t sectorAddr;
-    uint32_t srcAddr, dstAddr;
+    uint32_t srcAddr;
+    uint32_t dstAddr;
     uint32_t wordsRemaining;
     uint16_t i;
 
-    /* Step 1: Erase Bank 0 sectors 4-127 (application area) */
-    for (i = 0; i < APP_SECTOR_COUNT; i++)
+    /* Erase the entire application area — 120 sectors */
+    for (i = 0U; i < APP_SECTOR_COUNT; i++)
     {
         sectorAddr = BANK0_APP_START + ((uint32_t)i * SECTOR_SIZE_WORDS);
         eraseSector(sectorAddr);
     }
 
-    /* Step 2: Copy from Bank 2 to Bank 0 app area, 8 words at a time */
-    srcAddr = BANK2_START;
-    dstAddr = BANK0_APP_START;
-    wordsRemaining = (imageSize + 1) / 2;  /* bytes â†’ 16-bit words */
+    /* Program the image 8 words at a time */
+    srcAddr        = BANK2_START;
+    dstAddr        = BANK0_APP_START;
+    wordsRemaining = (imageSize + 1U) / 2U;  /* bytes → 16-bit words */
 
-    while (wordsRemaining >= 8)
+    while (wordsRemaining >= 8U)
     {
-        programWords(dstAddr, (const uint16_t *)srcAddr);
-        srcAddr += 8;
-        dstAddr += 8;
-        wordsRemaining -= 8;
+        programEightWords(dstAddr, (const uint16_t *)srcAddr);
+        srcAddr        += 8U;
+        dstAddr        += 8U;
+        wordsRemaining -= 8U;
     }
 
-    /* Handle remaining words (pad with 0xFFFF) */
-    if (wordsRemaining > 0)
+    /* Handle any trailing words — pad with 0xFFFF so the flash ECC
+     * engine still sees a full 8-word block. */
+    if (wordsRemaining > 0U)
     {
         uint16_t padBuf[8];
-        for (i = 0; i < 8; i++)
+        for (i = 0U; i < 8U; i++)
         {
             if (i < wordsRemaining)
+            {
                 padBuf[i] = *((volatile uint16_t *)(srcAddr + i));
+            }
             else
-                padBuf[i] = 0xFFFF;
+            {
+                padBuf[i] = 0xFFFFU;
+            }
         }
-        programWords(dstAddr, padBuf);
+        programEightWords(dstAddr, padBuf);
     }
 }
 
-/* â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�
- *  ERASE one 2KB sector
- * â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•� */
+/* ══════════════════════════════════════════════════════════════
+ *  ERASE one flash sector
+ * ══════════════════════════════════════════════════════════════ */
 static void eraseSector(uint32_t sectorAddr)
 {
-    while (Fapi_checkFsmForReady() != Fapi_Status_FsmReady) {}
+    while (Fapi_checkFsmForReady() != Fapi_Status_FsmReady) { }
 
     Fapi_issueAsyncCommand(Fapi_ClearStatus);
-    while (Fapi_getFsmStatus() != 0) {}
+    while (Fapi_getFsmStatus() != 0U) { }
 
     Fapi_setupBankSectorEnable(
-        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTA, SEC0TO31);
+        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTA, SEC0_TO_31_UNLOCK);
     Fapi_setupBankSectorEnable(
-        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTB, SEC32To127);
+        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTB, SEC32_TO_127_UNLOCK);
 
-    Fapi_issueAsyncCommandWithAddress(Fapi_EraseSector, (uint32_t *)sectorAddr);
+    Fapi_issueAsyncCommandWithAddress(Fapi_EraseSector,
+                                      (uint32_t *)sectorAddr);
 
-    while (Fapi_checkFsmForReady() != Fapi_Status_FsmReady) {}
+    while (Fapi_checkFsmForReady() != Fapi_Status_FsmReady) { }
 }
 
-/* â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�
- *  PROGRAM 8 x uint16 words (512-bit aligned block)
- * â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•� */
-static void programWords(uint32_t destAddr, const uint16_t *src)
+/* ══════════════════════════════════════════════════════════════
+ *  PROGRAM 8 × uint16 words (one 512-bit block)
+ * ══════════════════════════════════════════════════════════════ */
+static void programEightWords(uint32_t destAddr, const uint16_t *src)
 {
-    while (Fapi_checkFsmForReady() != Fapi_Status_FsmReady) {}
+    while (Fapi_checkFsmForReady() != Fapi_Status_FsmReady) { }
 
     Fapi_setupBankSectorEnable(
-        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTA, SEC0TO31);
+        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTA, SEC0_TO_31_UNLOCK);
     Fapi_setupBankSectorEnable(
-        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTB, SEC32To127);
+        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTB, SEC32_TO_127_UNLOCK);
 
     Fapi_issueProgrammingCommand((uint32_t *)destAddr,
-                                 (uint16_t *)src, 8,
+                                 (uint16_t *)src, 8U,
                                  0, 0, Fapi_AutoEccGeneration);
 
-    while (Fapi_checkFsmForReady() == Fapi_Status_FsmBusy) {}
+    while (Fapi_checkFsmForReady() == Fapi_Status_FsmBusy) { }
 }
 
-/* â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�
- *  CLEAR BOOT FLAG â€” erase Bank 3 first sector
- * â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•� */
+/* ══════════════════════════════════════════════════════════════
+ *  CLEAR BOOT FLAG — just erase the sector
+ * ══════════════════════════════════════════════════════════════ */
 static void clearBootFlag(void)
 {
     eraseSector(BANK3_FLAG_ADDR);
 }
 
-/* â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�
- *  CRC32 over flash memory
- * â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•�â•� */
+/* ══════════════════════════════════════════════════════════════
+ *  CRC32 — IEEE 802.3 (reflected, init 0xFFFFFFFF, xor-out 0xFFFFFFFF).
+ *  Matches the CRC computed on the sender and by the application.
+ * ══════════════════════════════════════════════════════════════ */
 static uint32_t computeCRC32(uint32_t startAddr, uint32_t numBytes)
 {
-    uint32_t crc = 0xFFFFFFFF;
+    uint32_t crc      = 0xFFFFFFFFU;
+    uint32_t numWords = (numBytes + 1U) / 2U;
     volatile uint16_t *wordPtr = (volatile uint16_t *)startAddr;
-    uint32_t numWords = (numBytes + 1) / 2;
     uint32_t i;
 
-    for (i = 0; i < numWords; i++)
+    for (i = 0U; i < numWords; i++)
     {
         uint16_t word = wordPtr[i];
-        crc = (crc >> 8) ^ crc32Table[(crc ^ (word & 0xFF)) & 0xFF];
-        crc = (crc >> 8) ^ crc32Table[(crc ^ (word >> 8)) & 0xFF];
+        crc = (crc >> 8) ^ crc32Table[(crc ^ (word & 0xFFU)) & 0xFFU];
+        crc = (crc >> 8) ^ crc32Table[(crc ^ (word >> 8))     & 0xFFU];
     }
 
-    return crc ^ 0xFFFFFFFF;
+    return crc ^ 0xFFFFFFFFU;
 }
