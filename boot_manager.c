@@ -65,14 +65,19 @@
 #define BOOT_MCAN_TX_BUF_ADDR   0x0000U
 #define BOOT_MCAN_TX_BUF_NUM    1U
 
+/* ── Heartbeat ────────────────────────────────────────────────── */
+#define HEARTBEAT_BOOT_CAN_ID   0x7FFU
+
 /* ── Prototypes ───────────────────────────────────────────────── */
 static void      ledInit(void);
 static void      ledSet(uint16_t on);
 static void      configureMCANA(void);
+static void      configureMCANB(void);
 static void      canSendMsg(uint16_t canId, const uint8_t *payload, uint16_t len);
 static void      canSendHello(void);
 static void      canSendDebug(uint16_t canId, uint8_t b0, uint8_t b1,
                                uint32_t val1, uint32_t val2);
+static void      sendBootHeartbeat(void);
 static uint32_t  computeCRC32(uint32_t startAddr, uint32_t numBytes);
 static void      delayCycles(uint32_t cycles);
 static void      jumpToApp(void);
@@ -166,6 +171,8 @@ void main(void)
     ledInit();
     ledSet(1U);
     canSendHello();
+    configureMCANB();
+    sendBootHeartbeat();
     delayCycles(DEVICE_SYSCLK_FREQ / 7U);
     ledSet(0U);
 
@@ -340,6 +347,75 @@ static void canSendDebug(uint16_t canId, uint8_t b0, uint8_t b1,
     p[4] = (uint8_t)(val1 >> 16);  p[5] = (uint8_t)(val1 >> 24);
     p[6] = (uint8_t)(val2);        p[7] = (uint8_t)(val2 >> 8);
     canSendMsg(canId, p, 8U);
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  MCANB — M-Board bus for heartbeat
+ * ══════════════════════════════════════════════════════════════ */
+static void configureMCANB(void)
+{
+    MCAN_InitParams         initParams;
+    MCAN_MsgRAMConfigParams ramCfg;
+    MCAN_BitTimingParams    bitTimes;
+
+    memset(&initParams, 0, sizeof(initParams));
+    memset(&ramCfg,     0, sizeof(ramCfg));
+    memset(&bitTimes,   0, sizeof(bitTimes));
+
+    SysCtl_setMCANClk(CAN_MBOARD_SYSCTL, SYSCTL_MCANCLK_DIV_5);
+    GPIO_setPinConfig(CAN_MBOARD_TX_PIN);
+    GPIO_setPinConfig(CAN_MBOARD_RX_PIN);
+
+    initParams.fdMode    = 0x1U;
+    initParams.brsEnable = 0x1U;
+
+    ramCfg.txStartAddr   = BOOT_MCAN_TX_BUF_ADDR;
+    ramCfg.txBufNum      = BOOT_MCAN_TX_BUF_NUM;
+    ramCfg.txBufElemSize = MCAN_ELEM_SIZE_64BYTES;
+
+    bitTimes.nomRatePrescalar  = 0x5U;
+    bitTimes.nomTimeSeg1       = 0x6U;
+    bitTimes.nomTimeSeg2       = 0x1U;
+    bitTimes.nomSynchJumpWidth = 0x1U;
+    bitTimes.dataRatePrescalar  = 0x0U;
+    bitTimes.dataTimeSeg1       = 0xAU;
+    bitTimes.dataTimeSeg2       = 0x2U;
+    bitTimes.dataSynchJumpWidth = 0x2U;
+
+    while (FALSE == MCAN_isMemInitDone(CAN_MBOARD_BASE)) { }
+    MCAN_setOpMode(CAN_MBOARD_BASE, MCAN_OPERATION_MODE_SW_INIT);
+    while (MCAN_OPERATION_MODE_SW_INIT != MCAN_getOpMode(CAN_MBOARD_BASE)) { }
+    MCAN_init(CAN_MBOARD_BASE, &initParams);
+    MCAN_setBitTime(CAN_MBOARD_BASE, &bitTimes);
+    MCAN_msgRAMConfig(CAN_MBOARD_BASE, &ramCfg);
+    MCAN_setOpMode(CAN_MBOARD_BASE, MCAN_OPERATION_MODE_NORMAL);
+    while (MCAN_OPERATION_MODE_NORMAL != MCAN_getOpMode(CAN_MBOARD_BASE)) { }
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  HEARTBEAT — 0x7FF on MCANB (M-Board bus) = "I am in boot mode"
+ * ══════════════════════════════════════════════════════════════ */
+static void sendBootHeartbeat(void)
+{
+    MCAN_TxBufElement txMsg;
+    volatile uint32_t timeout;
+
+    memset(&txMsg, 0, sizeof(txMsg));
+    txMsg.id  = ((uint32_t)HEARTBEAT_BOOT_CAN_ID) << 18U;
+    txMsg.dlc = 8U;
+    txMsg.brs = 0x1U;
+    txMsg.fdf = 0x1U;
+    txMsg.efc = 1U;
+    txMsg.mm  = 0xB0U;
+    txMsg.data[0] = 'B';
+    txMsg.data[1] = 'O';
+    txMsg.data[2] = 'O';
+    txMsg.data[3] = 'T';
+
+    MCAN_writeMsgRam(CAN_MBOARD_BASE, MCAN_MEM_TYPE_BUF, 0U, &txMsg);
+    MCAN_txBufAddReq(CAN_MBOARD_BASE, 0U);
+    for (timeout = 0U; timeout < 2000000U; timeout++)
+        if (MCAN_getTxBufReqPend(CAN_MBOARD_BASE) == 0U) break;
 }
 
 /* ══════════════════════════════════════════════════════════════
