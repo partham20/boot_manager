@@ -170,9 +170,8 @@ void main(void)
 
     ledInit();
     ledSet(1U);
-    canSendHello();
-    configureMCANB();
-    sendBootHeartbeat();
+    canSendHello();         /* Inits MCANA (BU bus) + MCANB (M-Board bus), sends hello */
+    sendBootHeartbeat();    /* 0x7FF on MCANB — tells M-Board we are in boot mode */
     delayCycles(DEVICE_SYSCLK_FREQ / 7U);
     ledSet(0U);
 
@@ -267,7 +266,7 @@ static void ledSet(uint16_t on)
 }
 
 /* ══════════════════════════════════════════════════════════════
- *  CAN — MCANA on GPIO 4 (TX) / GPIO 5 (RX)
+ *  MCANA — BU-Board bus (needed for BU firmware OTA relay)
  * ══════════════════════════════════════════════════════════════ */
 static void configureMCANA(void)
 {
@@ -325,16 +324,18 @@ static void canSendMsg(uint16_t canId, const uint8_t *payload, uint16_t len)
     for (i = 0U; i < 8U && i < len; i++)
         txMsg.data[i] = payload[i];
 
-    MCAN_writeMsgRam(CAN_BU_BASE, MCAN_MEM_TYPE_BUF, 0U, &txMsg);
-    MCAN_txBufAddReq(CAN_BU_BASE, 0U);
+    /* All S-Board boot manager communication goes to M-Board via MCANB */
+    MCAN_writeMsgRam(CAN_MBOARD_BASE, MCAN_MEM_TYPE_BUF, 0U, &txMsg);
+    MCAN_txBufAddReq(CAN_MBOARD_BASE, 0U);
     for (timeout = 0U; timeout < 2000000U; timeout++)
-        if (MCAN_getTxBufReqPend(CAN_BU_BASE) == 0U) break;
+        if (MCAN_getTxBufReqPend(CAN_MBOARD_BASE) == 0U) break;
 }
 
 static void canSendHello(void)
 {
     uint8_t p[8] = {'B','O','O','T','M','G','R',0x01};
-    configureMCANA();
+    configureMCANA();   /* Init MCANA for BU-Board OTA relay */
+    configureMCANB();   /* Init MCANB for M-Board communication */
     canSendMsg(CAN_ID_HELLO, p, 8U);
 }
 
