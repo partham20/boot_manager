@@ -33,6 +33,7 @@
 #include <string.h>
 #include "driverlib.h"
 #include "device.h"
+#include "can_config.h"
 #include "FlashTech_F28P55x_C28x.h"
 #include "flash_programming_f28p55x.h"
 
@@ -271,9 +272,9 @@ static void configureMCANA(void)
     memset(&ramCfg,     0, sizeof(ramCfg));
     memset(&bitTimes,   0, sizeof(bitTimes));
 
-    SysCtl_setMCANClk(SYSCTL_MCANA, SYSCTL_MCANCLK_DIV_5);
-    GPIO_setPinConfig(GPIO_4_MCANA_TX);
-    GPIO_setPinConfig(GPIO_5_MCANA_RX);
+    SysCtl_setMCANClk(CAN_BU_SYSCTL, SYSCTL_MCANCLK_DIV_5);
+    GPIO_setPinConfig(CAN_BU_TX_PIN);
+    GPIO_setPinConfig(CAN_BU_RX_PIN);
 
     initParams.fdMode    = 0x1U;
     initParams.brsEnable = 0x1U;
@@ -291,14 +292,14 @@ static void configureMCANA(void)
     bitTimes.dataTimeSeg2       = 0x2U;
     bitTimes.dataSynchJumpWidth = 0x2U;
 
-    while (FALSE == MCAN_isMemInitDone(MCANA_DRIVER_BASE)) { }
-    MCAN_setOpMode(MCANA_DRIVER_BASE, MCAN_OPERATION_MODE_SW_INIT);
-    while (MCAN_OPERATION_MODE_SW_INIT != MCAN_getOpMode(MCANA_DRIVER_BASE)) { }
-    MCAN_init(MCANA_DRIVER_BASE, &initParams);
-    MCAN_setBitTime(MCANA_DRIVER_BASE, &bitTimes);
-    MCAN_msgRAMConfig(MCANA_DRIVER_BASE, &ramCfg);
-    MCAN_setOpMode(MCANA_DRIVER_BASE, MCAN_OPERATION_MODE_NORMAL);
-    while (MCAN_OPERATION_MODE_NORMAL != MCAN_getOpMode(MCANA_DRIVER_BASE)) { }
+    while (FALSE == MCAN_isMemInitDone(CAN_BU_BASE)) { }
+    MCAN_setOpMode(CAN_BU_BASE, MCAN_OPERATION_MODE_SW_INIT);
+    while (MCAN_OPERATION_MODE_SW_INIT != MCAN_getOpMode(CAN_BU_BASE)) { }
+    MCAN_init(CAN_BU_BASE, &initParams);
+    MCAN_setBitTime(CAN_BU_BASE, &bitTimes);
+    MCAN_msgRAMConfig(CAN_BU_BASE, &ramCfg);
+    MCAN_setOpMode(CAN_BU_BASE, MCAN_OPERATION_MODE_NORMAL);
+    while (MCAN_OPERATION_MODE_NORMAL != MCAN_getOpMode(CAN_BU_BASE)) { }
 }
 
 static void canSendMsg(uint16_t canId, const uint8_t *payload, uint16_t len)
@@ -317,10 +318,10 @@ static void canSendMsg(uint16_t canId, const uint8_t *payload, uint16_t len)
     for (i = 0U; i < 8U && i < len; i++)
         txMsg.data[i] = payload[i];
 
-    MCAN_writeMsgRam(MCANA_DRIVER_BASE, MCAN_MEM_TYPE_BUF, 0U, &txMsg);
-    MCAN_txBufAddReq(MCANA_DRIVER_BASE, 0U);
+    MCAN_writeMsgRam(CAN_BU_BASE, MCAN_MEM_TYPE_BUF, 0U, &txMsg);
+    MCAN_txBufAddReq(CAN_BU_BASE, 0U);
     for (timeout = 0U; timeout < 2000000U; timeout++)
-        if (MCAN_getTxBufReqPend(MCANA_DRIVER_BASE) == 0U) break;
+        if (MCAN_getTxBufReqPend(CAN_BU_BASE) == 0U) break;
 }
 
 static void canSendHello(void)
