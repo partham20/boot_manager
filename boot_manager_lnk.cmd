@@ -8,15 +8,15 @@
  *
  * Memory map:
  *   0x080000-0x080001  codestart (2 words, jump to _c_int00)
- *   0x080002-0x081FFF  boot manager code + const (sectors 0-7, 8KB)
- *   0x082000+           APPLICATION (not touched by this project)
+ *   0x080002-0x083FFF  boot manager code + const (sectors 0-15, 16KB)
+ *   0x084000+           APPLICATION (not touched by this project)
  */
 
 MEMORY
 {
-    /* Boot manager flash — sectors 0-3 only (4KB) */
+    /* Boot manager flash — sectors 0-15 (16KB) */
     BEGIN           : origin = 0x080000, length = 0x000002
-    BOOT_FLASH      : origin = 0x080002, length = 0x001FFE  /* 8KB - 2 words */
+    BOOT_FLASH      : origin = 0x080002, length = 0x003FFE  /* 16KB - 2 words */
 
     /* RAM for stack, data, and flash API execution */
     BOOT_RSVD       : origin = 0x000002, length = 0x000126  /* ROM boot stack */
@@ -25,6 +25,7 @@ MEMORY
 
     RAMLS0          : origin = 0x008000, length = 0x000800
     RAMLS1          : origin = 0x008800, length = 0x000800
+    RAMLS2          : origin = 0x009000, length = 0x000800  /* Ring buffer for FW receive */
 
     RESET           : origin = 0x3FFFC0, length = 0x000002
 }
@@ -47,6 +48,9 @@ SECTIONS
     .init_array     : > BOOT_FLASH, ALIGN(8)
     .data           : > RAMM0
     .sysmem         : > RAMM0
+
+    /* FW receive ring buffer (32 x 64 bytes = 2KB) */
+    .boot_ring      : > RAMLS2
 #endif
 
     /*

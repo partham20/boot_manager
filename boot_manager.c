@@ -1,19 +1,35 @@
 /*
- * boot_manager.c
+ * boot_manager.c  —  S-Board variant (expanded 16KB)
  *
- * Boot Manager for F28P55x — lives in Bank 0 Sectors 0-7 (0x080000-0x081FFF).
+ * Boot Manager for the S-Board (F28P550SG9). Lives in Bank 0 Sectors
+ * 0-15 (0x080000-0x083FFF).
  * NEVER erased by OTA. Loaded via JTAG once at manufacturing.
+ *
+ * MCANA (GPIO 1 TX / GPIO 0 RX) is the BU-Board bus (relay/debug).
+ * MCANB (GPIO 2 TX / GPIO 3 RX) is the M-Board bus (heartbeat + OTA).
  *
  * On every boot:
  *   1. Device_init() — 150 MHz PLL, flash wait-states, watchdog off.
  *   2. LED blink on GPIO 21.
- *   3. BOOT_MGR_HELLO CAN frame on MCANA (ID 0x09).
+ *   3. BOOT_MGR_HELLO CAN frame on MCANB (ID 0x09).
  *   4. Read boot flag at Bank 3, sector 0 (0x0E0000).
  *   5. If flag = 0xA5A5/0x5A5A and Bank 2 CRC matches:
- *        erase Bank 0 sectors 8..127, copy Bank 2 -> Bank 0, clear flag, reset.
- *   6. Otherwise: jump to application at 0x082000.
+ *        erase Bank 0 sectors 16..127, copy Bank 2 -> Bank 0, clear flag, reset.
+ *   6. Check OTA receive-mode flag at Bank 3, sector 1 (0x0E0400).
+ *      If flag = 0xB007: enter FW receive mode (bootFwReceiveMode).
+ *   7. Otherwise: jump to application at 0x084000.
  *
- * CRITICAL: eraseSector / programEightWords / copyBank2ToBank0 / clearBootFlag
+ * OTA FW Receive Mode:
+ *   - Reconfigures MCANB with RX FIFO + filters for OTA CAN IDs.
+ *   - State machine: IDLE -> PREPARING -> WAITING_HEADER -> RECEIVING ->
+ *     VERIFYING -> DONE/ABORT.
+ *   - Receives firmware data frames on CAN ID 6 into a ring buffer.
+ *   - Drains ring buffer to Bank 2 flash via RAM-resident write functions.
+ *   - On successful verify + activate: writes copy-flag and resets so the
+ *     boot manager copies Bank 2 -> Bank 0 on next boot.
+ *
+ * CRITICAL: eraseSector / programEightWords / copyBank2ToBank0 / clearBootFlag /
+ *           writePayloadToBank2 / eraseOtaFlag / writeBootFlagForOTA / bootMcanISR
  *           MUST execute from RAM (.TI.ramfunc), because the flash controller
  *           locks the entire flash module while an erase/program is in progress.
  *           Code running from flash would stall the CPU.
@@ -26,6 +42,7 @@
  *   0x1B  COPY_DONE     — copy complete
  *   0x1C  NO_UPDATE     — no flag, jumping to app
  *   0x1D  CRC_FAIL      — CRC mismatch
+ *   0x29  OTA_MODE      — entered OTA receive mode
  *
  * Author: Parthasarathy.M
  */
@@ -38,13 +55,19 @@
 #include "flash_programming_f28p55x.h"
 
 /* ── Memory map ───────────────────────────────────────────────── */
-#define APP_ENTRY_ADDR          0x082000UL
-#define BANK0_APP_START         0x082000UL
+#define APP_ENTRY_ADDR          0x084000UL  /* Sector 16 (sectors 0-15 = boot manager) */
+#define BANK0_APP_START         0x084000UL
 #define BANK2_START             0x0C0000UL
-#define BANK3_FLAG_ADDR         0x0E0000UL
+#define BANK3_FLAG_ADDR         0x0E0000UL  /* Copy flag (Bank 3, sector 0) */
+#define BANK3_OTA_FLAG_ADDR     0x0E0400UL  /* OTA receive-mode flag (Bank 3, sector 1) */
 
 #define SECTOR_SIZE_WORDS       0x400U      /* 1KB sector = 0x400 16-bit words */
-#define APP_SECTOR_COUNT        120U        /* Sectors 8..127 */
+#define APP_SECTOR_COUNT        112U        /* Sectors 16..127 */
+#define BANK2_SECTOR_COUNT      128U        /* Full Bank 2 for staging */
+
+/* ── OTA receive-mode flag ────────────────────────────────────── */
+#define FLAG_OTA_MODE_MAGIC     0xB007U
+#define FLAG_OTA_PROTO_SBOARD   0x01U
 
 #define SEC_UNLOCK_A            0x00000000U
 #define SEC_UNLOCK_B            0x00000000U
@@ -68,6 +91,62 @@
 /* ── Heartbeat ────────────────────────────────────────────────── */
 #define HEARTBEAT_BOOT_CAN_ID   0x7FFU
 
+/* ── S-Board OTA CAN IDs (M-Board <-> S-Board, on MCANB) ──────── */
+#define SB_FW_DATA_CAN_ID      0x06U
+#define SB_FW_CMD_CAN_ID       0x07U
+#define SB_FW_RESP_CAN_ID      0x08U
+
+/* ── S-Board OTA command codes ──────────────────────────────────── */
+#define SB_CMD_FW_START         0x30U
+#define SB_CMD_FW_HEADER        0x31U
+#define SB_CMD_FW_COMPLETE      0x33U
+
+/* ── S-Board OTA response codes ─────────────────────────────────── */
+#define SB_RESP_FW_ACK          0x25U
+#define SB_RESP_FW_NAK          0x26U
+#define SB_RESP_FW_CRC_PASS     0x27U
+#define SB_RESP_FW_CRC_FAIL     0x28U
+
+/* ── Ring buffer ─────────────────────────────────────────────── */
+#define BOOT_RX_RING_SIZE       32U
+#define BOOT_RX_RING_MASK       (BOOT_RX_RING_SIZE - 1U)
+
+/* ── Burst ACK ───────────────────────────────────────────────── */
+#define SB_FW_BURST_SIZE        16U
+
+/* ── Timeouts ────────────────────────────────────────────────── */
+#define OTA_SESSION_TIMEOUT_MS  120000UL
+#define OTA_IDLE_TIMEOUT_MS     30000UL
+
+/* ── Ring buffer type & storage ───────────────────────────────── */
+typedef struct { uint8_t payload[64]; } BootRxEntry;
+#pragma DATA_SECTION(bootRxRing, ".boot_ring")
+static BootRxEntry bootRxRing[BOOT_RX_RING_SIZE];
+static volatile uint16_t bootRxHead = 0;
+static uint16_t bootRxTail = 0;
+
+/* ── FW receive state machine ────────────────────────────────── */
+typedef enum {
+    BOOT_RX_IDLE,
+    BOOT_RX_PREPARING,
+    BOOT_RX_WAITING_HEADER,
+    BOOT_RX_RECEIVING,
+    BOOT_RX_VERIFYING,
+    BOOT_RX_DONE,
+    BOOT_RX_ABORT
+} BootRxState;
+
+/* ── OTA receive state variables ─────────────────────────────── */
+static volatile BootRxState bootRxState = BOOT_RX_IDLE;
+static uint32_t bootRxImageSize = 0;
+static uint32_t bootRxImageCRC = 0;
+static uint32_t bootRxWriteAddr = 0;
+static uint32_t bootRxBytesReceived = 0;
+static uint16_t bootRxBurstCount = 0;
+static uint16_t bootRxSeq = 0;
+static volatile uint8_t bootRxPendingCmd = 0;
+static volatile uint8_t bootRxCmdData[64];
+
 /* ── Prototypes ───────────────────────────────────────────────── */
 static void      ledInit(void);
 static void      ledSet(uint16_t on);
@@ -88,6 +167,16 @@ static void      eraseSector(uint32_t sectorAddr);
 static void      programEightWords(uint32_t destAddr, const uint16_t *src);
 static void      copyBank2ToBank0(uint32_t imageSize);
 static void      clearBootFlag(void);
+
+/* OTA FW receive functions */
+__interrupt void         bootMcanISR(void);
+static void              configureMCANB_RX(void);
+static void              bootFwSendResponse(uint8_t respCode, uint16_t seq);
+static Fapi_StatusType   writePayloadToBank2(const uint8_t *payload);
+static void              eraseOtaFlag(void);
+static void              writeBootFlagForOTA(void);
+static void              eraseStagingBank(void);
+static void              bootFwReceiveMode(void);
 
 /* ── CRC32 table ──────────────────────────────────────────────── */
 static const uint32_t crc32Table[256] = {
@@ -244,6 +333,16 @@ void main(void)
         canSendDebug(CAN_ID_NO_UPDATE,
                      (uint8_t)(updatePending & 0xFF),
                      (uint8_t)(crcValid & 0xFF), 0, 0);
+    }
+
+    /* Check OTA receive-mode flag at Bank 3 sector 1 */
+    {
+        volatile uint16_t *otaFlag = (volatile uint16_t *)BANK3_OTA_FLAG_ADDR;
+        if (otaFlag[0] == FLAG_OTA_MODE_MAGIC)
+        {
+            bootFwReceiveMode();
+            /* If we return here, OTA was aborted/timed out — jump to app */
+        }
     }
 
     jumpToApp();
@@ -531,6 +630,437 @@ static void copyBank2ToBank0(uint32_t imageSize)
 static void clearBootFlag(void)
 {
     eraseSector(BANK3_FLAG_ADDR);
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  OTA CAN ISR — MUST execute from RAM
+ *
+ *  Handles RX FIFO 0 (data frames, ID 6) and dedicated
+ *  RX buffer 0 (command frames, ID 7) on MCANB.
+ * ══════════════════════════════════════════════════════════════ */
+#pragma CODE_SECTION(bootMcanISR, ".TI.ramfunc")
+__interrupt void bootMcanISR(void)
+{
+    uint32_t intrStatus = MCAN_getIntrStatus(CAN_MBOARD_BASE);
+    MCAN_clearIntrStatus(CAN_MBOARD_BASE, intrStatus);
+    MCAN_clearInterrupt(CAN_MBOARD_BASE, 0x2U);
+
+    /* RX FIFO 0 — data frames (ID 6) */
+    if (intrStatus & MCAN_IR_RF0N_MASK)
+    {
+        MCAN_RxFIFOStatus fifoSt;
+        fifoSt.num = MCAN_RX_FIFO_NUM_0;
+        MCAN_getRxFIFOStatus(CAN_MBOARD_BASE, &fifoSt);
+        while (fifoSt.fillLvl > 0)
+        {
+            MCAN_RxBufElement rxElem;
+            MCAN_readMsgRam(CAN_MBOARD_BASE, MCAN_MEM_TYPE_FIFO, 0U,
+                            MCAN_RX_FIFO_NUM_0, &rxElem);
+
+            /* Copy payload to ring buffer if in RECEIVING state */
+            if (bootRxState == BOOT_RX_RECEIVING)
+            {
+                uint16_t nextHead = (bootRxHead + 1U) & BOOT_RX_RING_MASK;
+                if (nextHead != bootRxTail)  /* not full */
+                {
+                    uint16_t i;
+                    for (i = 0; i < 64; i++)
+                        bootRxRing[bootRxHead].payload[i] = rxElem.data[i];
+                    bootRxHead = nextHead;
+                }
+            }
+
+            MCAN_writeRxFIFOAck(CAN_MBOARD_BASE, MCAN_RX_FIFO_NUM_0, fifoSt.getIdx);
+            MCAN_getRxFIFOStatus(CAN_MBOARD_BASE, &fifoSt);
+        }
+    }
+
+    /* Dedicated RX buffer — command frames (ID 7) */
+    if (intrStatus & MCAN_IR_DRX_MASK)
+    {
+        MCAN_RxNewDataStatus newData;
+        MCAN_getNewDataStatus(CAN_MBOARD_BASE, &newData);
+        if (newData.statusLow & (1UL << 0U))  /* buffer 0 */
+        {
+            MCAN_RxBufElement rxElem;
+            MCAN_readMsgRam(CAN_MBOARD_BASE, MCAN_MEM_TYPE_BUF, 0U, 0U, &rxElem);
+
+            /* S-Board has no board addressing — accept all commands */
+            bootRxPendingCmd = rxElem.data[0];
+            {
+                uint16_t i;
+                for (i = 0; i < 64; i++)
+                    bootRxCmdData[i] = rxElem.data[i];
+            }
+        }
+        MCAN_clearNewDataStatus(CAN_MBOARD_BASE, &newData);
+    }
+
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP9);
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  OTA CAN RX Configuration — reconfigure MCANB with RX FIFO
+ *  + filters for OTA CAN IDs (6 = data, 7 = command)
+ * ══════════════════════════════════════════════════════════════ */
+static void configureMCANB_RX(void)
+{
+    MCAN_InitParams initParams;
+    MCAN_MsgRAMConfigParams ramCfg;
+    MCAN_StdMsgIDFilterElement filt;
+    MCAN_BitTimingParams bitTimes;
+
+    memset(&initParams, 0, sizeof(initParams));
+    memset(&ramCfg, 0, sizeof(ramCfg));
+    memset(&filt, 0, sizeof(filt));
+    memset(&bitTimes, 0, sizeof(bitTimes));
+
+    MCAN_setOpMode(CAN_MBOARD_BASE, MCAN_OPERATION_MODE_SW_INIT);
+    while (MCAN_OPERATION_MODE_SW_INIT != MCAN_getOpMode(CAN_MBOARD_BASE)) {}
+
+    initParams.fdMode = 0x1U;
+    initParams.brsEnable = 0x1U;
+
+    /* Message RAM: 3 filters, FIFO0 (16 entries for data), 1 RX buf (cmd), 2 TX bufs */
+    ramCfg.flssa = 0x0U;
+    ramCfg.lss = 3U;
+    ramCfg.rxFIFO0startAddr = 3U * 4U;  /* after 3 filter elements */
+    ramCfg.rxFIFO0size = 16U;
+    ramCfg.rxFIFO0OpMode = 1U;  /* overwrite */
+    ramCfg.rxFIFO0ElemSize = MCAN_ELEM_SIZE_64BYTES;
+    ramCfg.rxBufStartAddr = ramCfg.rxFIFO0startAddr + (18U * 4U * 16U);
+    ramCfg.rxBufElemSize = MCAN_ELEM_SIZE_64BYTES;
+    ramCfg.txStartAddr = ramCfg.rxBufStartAddr + (18U * 4U * 1U);
+    ramCfg.txBufNum = 2U;
+    ramCfg.txBufElemSize = MCAN_ELEM_SIZE_64BYTES;
+
+    bitTimes.nomRatePrescalar = 0x5U;
+    bitTimes.nomTimeSeg1 = 0x6U;
+    bitTimes.nomTimeSeg2 = 0x1U;
+    bitTimes.nomSynchJumpWidth = 0x1U;
+    bitTimes.dataRatePrescalar = 0x0U;
+    bitTimes.dataTimeSeg1 = 0xAU;
+    bitTimes.dataTimeSeg2 = 0x2U;
+    bitTimes.dataSynchJumpWidth = 0x2U;
+
+    MCAN_init(CAN_MBOARD_BASE, &initParams);
+    MCAN_setBitTime(CAN_MBOARD_BASE, &bitTimes);
+    MCAN_msgRAMConfig(CAN_MBOARD_BASE, &ramCfg);
+
+    /* Filter 0: ID 6 (data) -> FIFO 0 */
+    filt.sfec = MCAN_STDFILTEC_FIFO0;
+    filt.sft = MCAN_STDFILT_CLASSIC;
+    filt.sfid1 = SB_FW_DATA_CAN_ID;
+    filt.sfid2 = 0x7FFU;
+    MCAN_addStdMsgIDFilter(CAN_MBOARD_BASE, 0U, &filt);
+
+    /* Filter 1: ID 7 (cmd) -> Dedicated RX Buffer 0 */
+    filt.sfec = MCAN_STDFILTEC_RXBUFF;
+    filt.sft = MCAN_STDFILT_CLASSIC;
+    filt.sfid1 = SB_FW_CMD_CAN_ID;
+    filt.sfid2 = 0x000U;  /* buffer index 0 */
+    MCAN_addStdMsgIDFilter(CAN_MBOARD_BASE, 1U, &filt);
+
+    /* Filter 2: reject all others */
+    filt.sfec = MCAN_STDFILTEC_REJECT;
+    filt.sft = MCAN_STDFILT_CLASSIC;
+    filt.sfid1 = 0x000U;
+    filt.sfid2 = 0x000U;
+    MCAN_addStdMsgIDFilter(CAN_MBOARD_BASE, 2U, &filt);
+
+    MCAN_setOpMode(CAN_MBOARD_BASE, MCAN_OPERATION_MODE_NORMAL);
+    while (MCAN_OPERATION_MODE_NORMAL != MCAN_getOpMode(CAN_MBOARD_BASE)) {}
+
+    /* Enable interrupts */
+    MCAN_enableIntr(CAN_MBOARD_BASE, MCAN_INTR_MASK_ALL, 1U);
+    MCAN_selectIntrLine(CAN_MBOARD_BASE, MCAN_INTR_MASK_ALL, MCAN_INTR_LINE_NUM_1);
+    MCAN_enableIntrLine(CAN_MBOARD_BASE, MCAN_INTR_LINE_NUM_1, 1U);
+
+    Interrupt_register(CAN_MBOARD_INT_LINE1, &bootMcanISR);
+    Interrupt_enable(CAN_MBOARD_INT_LINE1);
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  OTA CAN Response — send response on CAN ID 8 via MCANB
+ * ══════════════════════════════════════════════════════════════ */
+static void bootFwSendResponse(uint8_t respCode, uint16_t seq)
+{
+    MCAN_TxBufElement txMsg;
+    volatile uint32_t timeout;
+
+    memset(&txMsg, 0, sizeof(txMsg));
+    txMsg.id = ((uint32_t)SB_FW_RESP_CAN_ID) << 18U;
+    txMsg.dlc = 15U;
+    txMsg.brs = 0x1U;
+    txMsg.fdf = 0x1U;
+    txMsg.efc = 1U;
+    txMsg.mm = 0xCFU;
+    txMsg.data[0] = respCode;
+    txMsg.data[1] = 0x00U;  /* S-Board has no board ID — always 0 */
+    txMsg.data[2] = (uint8_t)(seq & 0xFFU);
+    txMsg.data[3] = (uint8_t)((seq >> 8) & 0xFFU);
+    txMsg.data[4] = (uint8_t)bootRxState;
+    txMsg.data[5] = (uint8_t)(bootRxBytesReceived & 0xFFU);
+    txMsg.data[6] = (uint8_t)((bootRxBytesReceived >> 8) & 0xFFU);
+    txMsg.data[7] = (uint8_t)((bootRxBytesReceived >> 16) & 0xFFU);
+
+    MCAN_writeMsgRam(CAN_MBOARD_BASE, MCAN_MEM_TYPE_BUF, 0U, &txMsg);
+    MCAN_txBufAddReq(CAN_MBOARD_BASE, 0U);
+    for (timeout = 0U; timeout < 2000000U; timeout++)
+        if (MCAN_getTxBufReqPend(CAN_MBOARD_BASE) == 0U) break;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  RAM-RESIDENT OTA FLASH FUNCTIONS
+ * ══════════════════════════════════════════════════════════════ */
+
+/* Write 64 bytes (one CAN-FD payload) to Bank 2 staging area */
+#pragma CODE_SECTION(writePayloadToBank2, ".TI.ramfunc")
+static Fapi_StatusType writePayloadToBank2(const uint8_t *payload)
+{
+    uint16_t chunk;
+    for (chunk = 0; chunk < 4U; chunk++)
+    {
+        uint16_t wordBuf[8];
+        uint16_t i;
+        for (i = 0; i < 8U; i++)
+        {
+            uint16_t byteIdx = (chunk * 16U) + (i * 2U);
+            wordBuf[i] = ((uint16_t)payload[byteIdx]) |
+                          ((uint16_t)payload[byteIdx + 1U] << 8);
+        }
+
+        Fapi_StatusType st;
+        clearFSM();
+        Fapi_setupBankSectorEnable(
+            FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTA, SEC_UNLOCK_A);
+        Fapi_setupBankSectorEnable(
+            FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTB, SEC_UNLOCK_B);
+        st = Fapi_issueProgrammingCommand((uint32_t *)bootRxWriteAddr,
+                                           wordBuf, 8U, 0, 0,
+                                           Fapi_AutoEccGeneration);
+        if (st != Fapi_Status_Success) return st;
+        while (Fapi_checkFsmForReady() == Fapi_Status_FsmBusy) {}
+        bootRxWriteAddr += 8U;
+    }
+    return Fapi_Status_Success;
+}
+
+/* Clear the OTA receive-mode flag (Bank 3 sector 1) */
+#pragma CODE_SECTION(eraseOtaFlag, ".TI.ramfunc")
+static void eraseOtaFlag(void)
+{
+    clearFSM();
+    Fapi_setupBankSectorEnable(
+        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTA, SEC_UNLOCK_A);
+    Fapi_setupBankSectorEnable(
+        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTB, SEC_UNLOCK_B);
+    Fapi_issueAsyncCommandWithAddress(Fapi_EraseSector,
+                                      (uint32_t *)BANK3_OTA_FLAG_ADDR);
+    while (Fapi_checkFsmForReady() != Fapi_Status_FsmReady) {}
+}
+
+/* Write copy-flag to Bank 3 sector 0 after successful OTA receive */
+#pragma CODE_SECTION(writeBootFlagForOTA, ".TI.ramfunc")
+static void writeBootFlagForOTA(void)
+{
+    uint16_t flagData[8];
+    flagData[0] = FLAG_UPDATE_PENDING;  /* 0xA5A5 */
+    flagData[1] = FLAG_CRC_VALID;       /* 0x5A5A */
+    flagData[2] = (uint16_t)(bootRxImageSize & 0xFFFFU);
+    flagData[3] = (uint16_t)((bootRxImageSize >> 16) & 0xFFFFU);
+    flagData[4] = (uint16_t)(bootRxImageCRC & 0xFFFFU);
+    flagData[5] = (uint16_t)((bootRxImageCRC >> 16) & 0xFFFFU);
+    flagData[6] = 0xFFFFU;
+    flagData[7] = 0xFFFFU;
+
+    /* Erase Bank 3 sector 0 */
+    clearFSM();
+    Fapi_setupBankSectorEnable(
+        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTA, SEC_UNLOCK_A);
+    Fapi_setupBankSectorEnable(
+        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTB, SEC_UNLOCK_B);
+    Fapi_issueAsyncCommandWithAddress(Fapi_EraseSector,
+                                      (uint32_t *)BANK3_FLAG_ADDR);
+    while (Fapi_checkFsmForReady() != Fapi_Status_FsmReady) {}
+
+    /* Program flag */
+    clearFSM();
+    Fapi_setupBankSectorEnable(
+        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTA, SEC_UNLOCK_A);
+    Fapi_setupBankSectorEnable(
+        FLASH_WRAPPER_PROGRAM_BASE + FLASH_O_CMDWEPROTB, SEC_UNLOCK_B);
+    Fapi_issueProgrammingCommand((uint32_t *)BANK3_FLAG_ADDR,
+                                  flagData, 8U, 0, 0,
+                                  Fapi_AutoEccGeneration);
+    while (Fapi_checkFsmForReady() == Fapi_Status_FsmBusy) {}
+}
+
+/* Erase all 128 sectors of Bank 2 (staging area) */
+static void eraseStagingBank(void)
+{
+    uint16_t i;
+    EALLOW;
+    for (i = 0; i < BANK2_SECTOR_COUNT; i++)
+    {
+        uint32_t addr = BANK2_START + ((uint32_t)i * SECTOR_SIZE_WORDS);
+        eraseSector(addr);
+    }
+    EDIS;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  OTA FW RECEIVE MODE — main receive function
+ *
+ *  Called from main() when the OTA receive-mode flag is set.
+ *  Blocks until firmware is received + activated, or aborted/
+ *  timed out.
+ * ══════════════════════════════════════════════════════════════ */
+static void bootFwReceiveMode(void)
+{
+    /* Init Flash API for Bank 2 writes */
+    EALLOW;
+    Fapi_initializeAPI(FlashTech_CPU0_BASE_ADDRESS,
+                       DEVICE_SYSCLK_FREQ / 1000000U);
+    Fapi_setActiveFlashBank(Fapi_FlashBank0);
+    EDIS;
+
+    /* Clear OTA flag so we don't loop back here on next boot */
+    EALLOW;
+    eraseOtaFlag();
+    EDIS;
+
+    /* Reconfigure MCANB with RX filters for OTA */
+    configureMCANB_RX();
+    EINT;
+
+    /* Init state */
+    bootRxState = BOOT_RX_IDLE;
+    bootRxHead = 0;
+    bootRxTail = 0;
+    bootRxPendingCmd = 0;
+    bootRxBytesReceived = 0;
+    bootRxBurstCount = 0;
+    bootRxSeq = 0;
+    bootRxWriteAddr = BANK2_START;
+
+    ledSet(1U);  /* LED on = in OTA mode */
+    canSendDebug(0x29U, 0x01U, 0x00U, 0U, 0U);  /* Debug: entered OTA mode */
+
+    /* Simple timeout using busy-wait counter */
+    volatile uint32_t idleCounter = 0;
+    uint32_t idleLimit = 150000000UL * 30U;  /* ~30 seconds at 150MHz */
+
+    while (bootRxState != BOOT_RX_DONE && bootRxState != BOOT_RX_ABORT)
+    {
+        /* Process pending command */
+        if (bootRxPendingCmd != 0)
+        {
+            uint8_t cmd = bootRxPendingCmd;
+            bootRxPendingCmd = 0;
+            idleCounter = 0;  /* Reset timeout on any command */
+
+            switch (cmd)
+            {
+                case SB_CMD_FW_START:
+                    bootRxState = BOOT_RX_PREPARING;
+                    eraseStagingBank();
+                    bootRxWriteAddr = BANK2_START;
+                    bootRxBytesReceived = 0;
+                    bootRxBurstCount = 0;
+                    bootRxSeq = 0;
+                    bootRxState = BOOT_RX_WAITING_HEADER;
+                    bootFwSendResponse(SB_RESP_FW_ACK, 0);
+                    break;
+
+                case SB_CMD_FW_HEADER:
+                    bootRxImageSize = ((uint32_t)bootRxCmdData[4]) |
+                                      ((uint32_t)bootRxCmdData[5] << 8) |
+                                      ((uint32_t)bootRxCmdData[6] << 16) |
+                                      ((uint32_t)bootRxCmdData[7] << 24);
+                    bootRxImageCRC  = ((uint32_t)bootRxCmdData[8]) |
+                                      ((uint32_t)bootRxCmdData[9] << 8) |
+                                      ((uint32_t)bootRxCmdData[10] << 16) |
+                                      ((uint32_t)bootRxCmdData[11] << 24);
+                    bootRxState = BOOT_RX_RECEIVING;
+                    bootFwSendResponse(SB_RESP_FW_ACK, 0);
+                    break;
+
+                case SB_CMD_FW_COMPLETE:
+                {
+                    /* Flush any remaining burst ACK */
+                    if (bootRxBurstCount > 0)
+                    {
+                        bootFwSendResponse(SB_RESP_FW_ACK, bootRxSeq);
+                        bootRxBurstCount = 0;
+                    }
+                    bootRxState = BOOT_RX_VERIFYING;
+                    uint32_t computed = computeCRC32(BANK2_START, bootRxImageSize);
+                    if (computed == bootRxImageCRC)
+                    {
+                        bootFwSendResponse(SB_RESP_FW_CRC_PASS, bootRxSeq);
+                        delayCycles(DEVICE_SYSCLK_FREQ / 100U);
+                        /* Write copy-flag then reset — boot manager will copy Bank2->Bank0 */
+                        EALLOW;
+                        writeBootFlagForOTA();
+                        EDIS;
+                        SysCtl_resetDevice();
+                        /* unreachable */
+                    }
+                    else
+                    {
+                        bootFwSendResponse(SB_RESP_FW_CRC_FAIL, bootRxSeq);
+                        bootRxState = BOOT_RX_ABORT;
+                    }
+                    break;
+                }
+
+                default:
+                    break;
+            }
+        }
+
+        /* Drain ring buffer to Bank 2 flash */
+        if (bootRxState == BOOT_RX_RECEIVING)
+        {
+            while (bootRxTail != bootRxHead)
+            {
+                idleCounter = 0;
+
+                EALLOW;
+                writePayloadToBank2(bootRxRing[bootRxTail].payload);
+                EDIS;
+
+                bootRxTail = (bootRxTail + 1U) & BOOT_RX_RING_MASK;
+                bootRxBytesReceived += 64U;
+                bootRxSeq++;
+                bootRxBurstCount++;
+
+                if (bootRxBurstCount >= SB_FW_BURST_SIZE)
+                {
+                    bootFwSendResponse(SB_RESP_FW_ACK, bootRxSeq);
+                    bootRxBurstCount = 0;
+                }
+            }
+
+            /* Final burst ACK if all bytes received */
+            if (bootRxBurstCount > 0 && bootRxBytesReceived >= bootRxImageSize)
+            {
+                bootFwSendResponse(SB_RESP_FW_ACK, bootRxSeq);
+                bootRxBurstCount = 0;
+            }
+        }
+
+        /* Timeout */
+        idleCounter++;
+        if (idleCounter >= idleLimit)
+        {
+            bootRxState = BOOT_RX_ABORT;
+        }
+    }
+
+    ledSet(0U);
+    DINT;
 }
 
 /* ══════════════════════════════════════════════════════════════
