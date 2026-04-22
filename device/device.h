@@ -272,8 +272,8 @@ extern "C"
 // To use INTOSC as the clock source, comment the #define USE_PLL_SRC_XTAL,
 // and uncomment the #define USE_PLL_SRC_INTOSC
 //
-#define USE_PLL_SRC_XTAL
-//#define USE_PLL_SRC_INTOSC
+//#define USE_PLL_SRC_XTAL
+#define USE_PLL_SRC_INTOSC
 
 
 #if defined(USE_PLL_SRC_XTAL)
